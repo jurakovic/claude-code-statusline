@@ -1,61 +1,44 @@
 # Claude Code Statusline
 
-<img width="1899" height="134" alt="image" src="https://github.com/user-attachments/assets/0f10afac-e1be-44f5-a953-d37132903765" />
-
-
-A feature-rich, single-file Node.js statusline for [Claude Code](https://claude.ai/code).
-One line at the bottom of your terminal that tells you everything you actually need:
-which model you're on, the live git state of your repo, how much context you've
-burned, your prompt-cache hit/write state, and your subscription rate limits.
+A small, single-file Node.js statusline for [Claude Code](https://claude.ai/code),
+trimmed from [ilia-pluzhnikov/claude-code-statusline](https://github.com/ilia-pluzhnikov/claude-code-statusline)
+down to the segments that track spend: how much context you've burned, your
+prompt-cache hit/write state, and your subscription rate limits. The model,
+directory and git segments are gone.
 
 No dependencies. No build step. Works on macOS, Linux, and Windows.
 
 ## Preview
 
 ```
-Op4.7:hg (1m) │ tweaks ▸ claude-…tusline (main) │ 3M 1? ↑2 push ⚠ md drift │ ██░░░ 480k/1M │ cache 87% ↓75k +360 1h:42m │ 5h:35%(2h15m) │ 7d:42%(4d)
+██░░░ 480k/1M 48% │ cache 87% ↓75k +360 1h:42m │ 5h:35% (2h15m) │ 7d:42% (4d)
 ```
 
-Each segment is color-coded (dim, bright, cyan, pink, green, yellow, orange, red) so the
-shape of the line itself communicates urgency at a glance. Labels are aggressively
-shortened so the line fits your terminal: the width budget is read from the `COLUMNS`
-environment variable that Claude Code exports to the script (v2.1.153+), with a fixed
-100-column fallback for older builds and manual runs.
-
-<img width="1280" height="636" alt="image" src="https://github.com/user-attachments/assets/c07f4e46-61cb-473e-99d6-d7b06a3fa3ec" />
-
+Each segment is color-coded so the shape of the line itself communicates urgency
+at a glance. Segments only appear when they have something to say.
 
 ## What you see, left to right
 
 
 | Segment | Meaning |
 |---------|---------|
-| `Op4.7 (1m)` | Current model, abbreviated: family (`Op`/`So`/`Ha`/`My`/`Fb`) glued to the version + context size (dim). `Opus 4.7 (1M context)` becomes `Op4.7 (1m)`, `Fable 5` becomes `Fb5`. Unrecognised model names are shown as-is. |
-| `Op4.7:hg` | Reasoning-effort tier as a lowercase code colon-glued to the model (same dim shade): `lo`/`md`/`hg`/`xhg`/`mx` for `low`/`medium`/`high`/`xhigh`/`max`. Reflects the live value (including mid-session `/effort` changes); the context size trails it — `Op4.7:hg (1m)`. Shown only on models that report `effort.level`; absent on models that don't support reasoning effort |
-| `claude-…tusline (main)` | Working directory basename (dim) + current branch in cyan; shows `(HEAD@<sha>)` in red for detached HEAD. The basename is trimmed to a 15-char `head…tail` middle ellipsis (7 chars each side) **only when the full status line would otherwise exceed the width budget** (the terminal width from `COLUMNS`, 100 columns when it's absent) — short lines keep the full name |
-| `tweaks ▸ statusline (main)` | When the working directory has moved away from where the session was launched (`workspace.project_dir` ≠ `workspace.current_dir`, e.g. after a `cd`), the launch dir basename is prepended as a dim `▸` breadcrumb so it's clear the session — and its transcript — is rooted elsewhere than `$PWD`. Hidden when the two match. Short lines keep both names in full; once the line would cross the width budget, width is reclaimed in stages — the current-dir name is ellipsised, then the launch name, then the breadcrumb is dropped entirely |
-| `3M 1A 1D 1R 2? 1!` | Working tree status, bucketed by VS Code-style codes: `M` = modified, `A` = added/staged, `D` = deleted, `R` = renamed, `?` = untracked. All shown dim. `!` = unmerged conflict, rendered separately in **red** because it's the only one that blocks a commit. Empty buckets are hidden — clean repo shows nothing |
-| `↑2 push` / `↓1 pull` | Local branch is ahead/behind `origin/<branch>` |
-| `⚠ md drift` | `CLAUDE.md` ↔ `AGENTS.md` ↔ `GEMINI.md` are out of sync |
-| `██░░░ 480k/1M` | Context window usage — 5-cell bar with half-block precision (`█▌░`, ~10% per step in 5 cells). When Claude Code provides absolute context counters, the bar is driven by `total_input_tokens / context_window_size` and the segment appends the raw counts (for example `480k/1M`). When only `remaining_percentage` is available, the bar falls back to `100 - remaining` |
+| `██░░░ 480k/1M 48%` | Context window usage — 5-cell bar with half-block precision (`█▌░`, ~10% per step in 5 cells), followed by the used percentage. When Claude Code provides absolute context counters, the bar is driven by `total_input_tokens / context_window_size` and the raw counts come before the percentage (`480k/1M 48%`). When only `remaining_percentage` is available, the bar falls back to `100 - remaining` and shows just the percentage |
 | `cache 87% ↓75k +360 1h:42m` | Prompt cache state. Read/write/input counters come from stdin `context_window.current_usage`; the session transcript only supplies the TTL bucket (`1h`/`5m`) and last-touch timestamp for the countdown. Hit ratio is `read / (input + write + read)`: `≥90%` bold green, `≥75%` green, `≥50%` yellow, below that orange, and `0%` bold red for a full miss/invalidation. `↓` means tokens read from cache, `+` or `↑` means tokens written. After `/compact`, `cache:reset` appears while stdin `current_usage` is null but the transcript shows earlier cache activity |
-| `5h:35%(2h15m)` | 5-hour rate limit usage + reset countdown (`Xh Ym` / `Mm`) |
-| `7d:42%(4d)` | 7-day rate limit usage + reset countdown. Coarse format: `Nd` while ≥ 2 days remain; `1dXh` for the final day (renders as `24h` at exactly 1 day so the unit doesn't lie); `Xh Ym` / `Mm` below 1 day |
+| `5h:35% (2h15m)` | 5-hour rate limit usage + reset countdown (`XhYm` / `Mm`) |
+| `7d:42% (4d)` | 7-day rate limit usage + reset countdown. Coarse format: `Nd` while ≥ 2 days remain; `1dXh` for the final day (renders as `24h` at exactly 1 day so the unit doesn't lie); `XhYm` / `Mm` below 1 day |
 
-The context bar and rate-limit percentages share the same color scale:
+The context bar and rate-limit percentages share one color ramp:
 
 | Used | Color |
 |------|-------|
-| < 50% | pink |
-| 50-65% | yellow |
-| 65-80% | orange |
-| ≥ 80% | red with a 💀 prefix on the context bar |
-
-The context bar has one extra absolute-token rule: once `total_input_tokens`
-crosses **250k**, pink is promoted to yellow regardless of the percentage
-scale. 250k is the practical "already a lot" cliff — model output quality
-degrades and Anthropic's long-context pricing tier kicks in around there —
-so a 1M-context session at 250k/1M (25% used) shouldn't render as cozy pink.
+| < 15% | cyan |
+| 15–29% | green |
+| 30–39% | lime |
+| 40–49% | yellow |
+| 50–59% | amber |
+| 60–69% | orange |
+| 70–79% | vermilion |
+| ≥ 80% | red, with a 💀 prefix on the context bar |
 
 ## Installation
 
@@ -79,8 +62,8 @@ so a 1M-context session at 250k/1M (25% used) shouldn't render as cozy pink.
 
 4. **Restart Claude Code.** That's it.
 
-The script reads the standard Claude Code statusline JSON from stdin (model,
-workspace, session, context window, rate limits) and writes a single ANSI-coloured
+The script reads the standard Claude Code statusline JSON from stdin (session,
+context window, rate limits) and writes a single ANSI-coloured
 line to stdout. It exits silently on any error so a broken statusline never blocks your
 session.
 
@@ -107,10 +90,9 @@ The drift detector turns this from an invisible bug into a visible one. The
 
 ### The hooks
 
-The MD-drift detector inside `statusline.js` only lights up if your project actually
-keeps `CLAUDE.md`, `AGENTS.md`, and `GEMINI.md` as a synchronized trio. The
-[`optional-hooks/`](./optional-hooks/) folder contains three small hooks that make
-the rest of the experience whole:
+The statusline itself no longer shows git or MD-drift state. The
+[`optional-hooks/`](./optional-hooks/) folder contains three small, independent hooks
+that surface it at session start instead:
 
 - **`md-sync-check.js`** — `SessionStart` hook. Warns Claude (via `additionalContext`) when the trio drifts.
 - **`sync-md.js`** — `PostToolUse` hook. When you `Edit`/`Write` `CLAUDE.md`, it auto-mirrors the content into `AGENTS.md` and `GEMINI.md`, rewriting the per-file `Sync:` line.
@@ -121,33 +103,29 @@ None of them are required for the statusline itself to work.
 
 ## How it stays fast
 
-- **All git checks are local.** No `git fetch`, no network, hard 1s timeout per command.
-- **Bridge file in `os.tmpdir()`.** The context-usage value is written to `claude-ctx-{session_id}.json` so other hooks (e.g. a `PostToolUse` context monitor) can read the same number without re-parsing stdin.
+- **No subprocesses, no network.** Everything comes from stdin plus the session transcript.
+- **Bounded transcript read.** Only the last 16 KB of the transcript is read, and only when the cache segment needs its TTL bucket or a `/compact` reset check.
 - **Stdin timeout (3s)** — if Claude Code never sends data, the script exits cleanly instead of hanging.
 
 ## Cross-platform notes
 
-- **Windows:** the script uses `windowsHide: true` on every git subprocess call, so no
-  console flashes appear during git polling.
 - **Path separators:** filesystem paths use `path.join` and `os.homedir()`;
   Claude transcript lookup intentionally mirrors Claude Code's project-slug
   convention by replacing drive colons, path separators, and dots with `-`.
 
 ## Customization
 
-The script is 370 lines of dependency-free Node.js. Open it and tweak.
+The script is a single file of dependency-free Node.js. Open it and tweak.
 The most common customizations:
 
 - **Hide the cache segment** — delete the `Prompt cache state` block. Useful if you don't run Claude Code in this terminal or don't want token counts visible.
-- **Change the colour thresholds** — search for `< 50` / `< 65` / `< 80` and edit.
-- **Hide the model name** — remove `\`\x1b[2m${model}\x1b[0m\`` from the `segments` array at the bottom.
+- **Change the colour thresholds** — edit the `bands` ramp near the top.
 - **Use a different separator** — change `' │ '` (the `│` character) on the final line.
 
 ## Requirements
 
 - Node.js (any modern version — uses only built-in modules)
 - Claude Code with statusline support (`statusLine` in `settings.json`)
-- Optional: `git` on `PATH` for the git-status segment
 
 ## А еще я пишу статьи
 

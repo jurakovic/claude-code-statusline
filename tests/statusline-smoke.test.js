@@ -13,22 +13,14 @@ function stripAnsi(s) {
   return s.replace(/\x1b\[[0-9;]*m/g, '');
 }
 
-function runStatusline(input, env = {}, execFileSyncStub = () => '') {
+function runStatusline(input, env = {}) {
   let stdout = '';
   const stdin = new EventEmitter();
   stdin.setEncoding = () => {};
-  // The width budget reads COLUMNS; the ambient terminal's value must not
-  // leak into tests — only an explicit `env` override sets it.
-  const mergedEnv = { ...process.env, ...env };
-  if (!('COLUMNS' in env)) delete mergedEnv.COLUMNS;
   const context = {
-    require: (name) => {
-      if (name === 'child_process') return { execFileSync: execFileSyncStub };
-      return require(name);
-    },
+    require,
     process: {
-      env: mergedEnv,
-      platform: process.platform,
+      env: { ...process.env, ...env },
       stdin,
       stdout: { write: (s) => { stdout += s; } },
       cwd: () => root,
@@ -52,7 +44,6 @@ function makeTempDir() {
 
 function inputFor(dir, overrides = {}) {
   return {
-    model: { display_name: 'Claude' },
     workspace: { current_dir: dir },
     session_id: 'test-session',
     ...overrides
@@ -90,67 +81,17 @@ function check(name, fn) {
   }
 }
 
-check('model shortening', () => {
+check('model, directory and git segments are not rendered', () => {
   const dir = makeTempDir();
-  const cases = [
-    ['Opus 4.7 (1M context)', 'Op4.7 (1m)'],
-    ['Sonnet 4.6', 'So4.6'],
-    ['Haiku 4.5', 'Ha4.5'],
-    ['Claude', 'Claude'],
-    ['claude-opus-4-7', 'Op4.7'],
-    ['Opus 5.0 (200K context)  ', 'Op5.0 (200k)'],
-    ['Fable 5', 'Fb5'],
-    ['claude-fable-5', 'Fb5'],
-    ['Æther 4.7', 'Æther 4.7'],
-    ['', 'Claude']
-  ];
-
-  for (const [display_name, expected] of cases) {
-    const { text } = runStatusline(inputFor(dir, { model: { display_name } }));
-    assert.strictEqual(text.split(' │ ')[0], expected, display_name);
-  }
-});
-
-check('effort tier renders as a lowercase :code glued to the model', () => {
-  const dir = makeTempDir();
-
-  // No effort object → first segment is just the model (unsupported model / back-compat).
-  const none = runStatusline(inputFor(dir, { model: { display_name: 'Opus 4.8' } }));
-  assert.strictEqual(none.text.split(' │ ')[0], 'Op4.8', `no effort: ${none.text}`);
-
-  // Each documented level maps to its lowercase code, colon-glued to the model.
-  const map = { low: 'lo', medium: 'md', high: 'hg', xhigh: 'xhg', max: 'mx' };
-  for (const [level, code] of Object.entries(map)) {
-    const { raw, text } = runStatusline(inputFor(dir, {
-      model: { display_name: 'Opus 4.8' },
-      effort: { level }
-    }));
-    assert.strictEqual(text.split(' │ ')[0], `Op4.8:${code}`, `${level}: ${text}`);
-    assert(raw.includes(`\x1b[2mOp4.8:${code}\x1b[0m`), `${level} shares the model's dim span: ${raw}`);
-  }
-
-  // The context suffix stays at the end, after the effort code.
-  const withCtx = runStatusline(inputFor(dir, {
-    model: { display_name: 'Opus 4.8 (1M context)' },
-    effort: { level: 'high' }
+  const { text } = runStatusline(inputFor(dir, {
+    model: { display_name: 'Opus 4.7 (1M context)' },
+    effort: { level: 'high' },
+    context_window: { remaining_percentage: 60 }
   }));
-  assert.strictEqual(withCtx.text.split(' │ ')[0], 'Op4.8:hg (1m)', `ctx after effort: ${withCtx.text}`);
+  assert.strictEqual(text, '██░░░ 40%');
 
-  // Unknown future level falls back to its first two chars (never vanishes).
-  const future = runStatusline(inputFor(dir, {
-    model: { display_name: 'Opus 4.8' },
-    effort: { level: 'ultra' }
-  }));
-  assert.strictEqual(future.text.split(' │ ')[0], 'Op4.8:ul', `unknown level: ${future.text}`);
-
-  // Object.prototype keys must not resolve through the EFFORT_CODES prototype
-  // chain (e.g. 'constructor' → the Object function rendered into the line);
-  // they take the generic first-two-chars fallback like any unknown level.
-  const proto = runStatusline(inputFor(dir, {
-    model: { display_name: 'Opus 4.8' },
-    effort: { level: 'constructor' }
-  }));
-  assert.strictEqual(proto.text.split(' │ ')[0], 'Op4.8:co', `prototype key: ${proto.text}`);
+  // Nothing to say → empty line.
+  assert.strictEqual(runStatusline({}).text, '');
 });
 
 check('context bar width and glyphs', () => {
@@ -188,7 +129,7 @@ check('context bar null/empty/zero handling', () => {
   assert(contextSegment(full).startsWith('💀 █████'), full);
 });
 
-check('context bar shows absolute token counts when available', () => {
+check('context bar shows the used percentage after the absolute token counts', () => {
   const dir = makeTempDir();
   const { text } = runStatusline(inputFor(dir, {
     context_window: {
@@ -199,32 +140,37 @@ check('context bar shows absolute token counts when available', () => {
   }));
   const segment = contextSegment(text);
   assert(segment, text);
-  assert(segment.includes('480k/1M'), segment);
+  assert(segment.endsWith('480k/1M 48%'), segment);
+
+  // Without absolute counters only the percentage follows the bar.
+  const pctOnly = runStatusline(inputFor(dir, {
+    context_window: { remaining_percentage: 60 }
+  })).text;
+  assert.strictEqual(contextSegment(pctOnly), '██░░░ 40%', pctOnly);
 });
 
-check('context bar bumps pink → yellow at 250k absolute tokens', () => {
+check('context bar and rate limits share one color ramp', () => {
   const dir = makeTempDir();
-  // 250k/1M = 25% used → would be pink by the percentage scale,
-  // but absolute 250k is an "already too much" cliff regardless of window size.
-  const { raw } = runStatusline(inputFor(dir, {
-    context_window: {
-      remaining_percentage: 75,
-      total_input_tokens: 250000,
-      context_window_size: 1000000
-    }
-  }));
-  assert(raw.includes('\x1b[33m'), `expected yellow at 250k abs, got: ${raw}`);
-  assert(!raw.includes('\x1b[38;2;255;125;218m'), `pink must not appear, got: ${raw}`);
-
-  // Below threshold stays pink.
-  const { raw: rawLow } = runStatusline(inputFor(dir, {
-    context_window: {
-      remaining_percentage: 75,
-      total_input_tokens: 249999,
-      context_window_size: 1000000
-    }
-  }));
-  assert(rawLow.includes('\x1b[38;2;255;125;218m'), `expected pink at 249999, got: ${rawLow}`);
+  const ramp = [
+    [0, '\x1b[38;2;34;184;207m'],  // cyan
+    [14, '\x1b[38;2;34;184;207m'],
+    [15, '\x1b[32m'],              // green
+    [30, '\x1b[38;2;116;184;22m'], // lime
+    [40, '\x1b[33m'],              // yellow
+    [50, '\x1b[38;2;240;140;0m'],  // amber
+    [60, '\x1b[38;2;255;140;0m'],  // orange
+    [70, '\x1b[38;2;255;87;34m'],  // vermilion
+    [79, '\x1b[38;2;255;87;34m'],
+    [80, '\x1b[31m'],              // red
+  ];
+  for (const [used, color] of ramp) {
+    const { raw } = runStatusline(inputFor(dir, {
+      context_window: { remaining_percentage: remainingForDisplayedUsed(used) },
+      rate_limits: { five_hour: { used_percentage: used } }
+    }));
+    assert(raw.startsWith(color), `context bar at ${used}%: ${JSON.stringify(raw)}`);
+    assert(raw.includes(`5h:${color}${used}%\x1b[0m`), `5h at ${used}%: ${JSON.stringify(raw)}`);
+  }
 });
 
 check('context bar prefers absolute tokens over remaining_percentage', () => {
@@ -232,7 +178,7 @@ check('context bar prefers absolute tokens over remaining_percentage', () => {
   // 800k/1M = 80% used → red + skull, regardless of what remaining_percentage says
   const { text } = runStatusline(inputFor(dir, {
     context_window: {
-      remaining_percentage: 90,  // would render as ~10% used (pink, empty bar)
+      remaining_percentage: 90,  // would render as ~10% used (cyan, empty bar)
       total_input_tokens: 800000,
       context_window_size: 1000000
     }
@@ -241,116 +187,6 @@ check('context bar prefers absolute tokens over remaining_percentage', () => {
   assert(segment, text);
   assert(segment.startsWith('💀 '), `expected skull at 80% real used, got: ${segment}`);
   assert(contextBar(segment) === '████░', `expected 4 full cells, got: ${contextBar(segment)}`);
-});
-
-check('dirname middle ellipsis triggers only when line >100 cols', () => {
-  const parent = makeTempDir();
-  const exact15 = path.join(parent, '123456789012345');
-  const exact16 = path.join(parent, '1234567890123456');
-  const huge = path.join(parent, '0123456789'.repeat(12)); // 120 chars, alone breaks 100
-  fs.mkdirSync(exact15);
-  fs.mkdirSync(exact16);
-  fs.mkdirSync(huge);
-
-  // Short line → no truncation regardless of dirname length.
-  const t15 = runStatusline(inputFor(exact15)).text;
-  assert(t15.includes('123456789012345'), `len-15: full kept, got ${t15}`);
-  assert(!t15.includes('…'), `len-15: no ellipsis expected, got ${t15}`);
-
-  const t16 = runStatusline(inputFor(exact16)).text;
-  assert(t16.includes('1234567890123456'), `len-16 short line: full kept, got ${t16}`);
-  assert(!t16.includes('…'), `len-16 short line: no ellipsis, got ${t16}`);
-
-  // Dotfile-style name should pass through.
-  assert(runStatusline(inputFor(path.join(parent, '.claude'))).text.includes('.claude'));
-
-  // Long line → middle ellipsis kicks in.
-  const big = runStatusline(inputFor(huge)).text;
-  assert(big.includes('0123456…3456789'), `huge dirname: ellipsis expected, got ${big}`);
-  assert(!big.includes('0123456789012345'), `huge dirname: full must NOT appear, got ${big}`);
-});
-
-check('git segment buckets porcelain codes, branch, and ahead push', () => {
-  const dir = makeTempDir();
-  const git = (file, args) => {
-    assert.strictEqual(file, 'git');
-    const key = args.join(' ');
-    const responses = {
-      'status --porcelain': ' M foo.js\n?? bar.js',
-      'branch --show-current': 'main',
-      'rev-list --count HEAD..refs/remotes/origin/main': '0',
-      'rev-list --count refs/remotes/origin/main..HEAD': '2'
-    };
-    return responses[key] || '';
-  };
-
-  const { text } = runStatusline(inputFor(dir), {}, git);
-  assert(text.includes(`${path.basename(dir)} (main)`), text);
-  assert(text.includes('1M 1?'), text);
-  assert(text.includes('↑2 push'), text);
-  assert(!text.includes('pull'), text);
-  assert(!text.includes('dirty'), text);
-});
-
-check('git segment buckets all VS Code-style status codes', () => {
-  const dir = makeTempDir();
-  const cases = [
-    // [porcelain, expected substring, description]
-    [' M a.js',                    '1M',          'modified in WT'],
-    ['M  a.js',                    '1M',          'modified staged'],
-    ['MM a.js',                    '1M',          'modified twice'],
-    ['A  a.js',                    '1A',          'added staged'],
-    ['AM a.js',                    '1A',          'added then modified'],
-    [' D a.js',                    '1D',          'deleted in WT'],
-    ['D  a.js',                    '1D',          'deleted staged'],
-    ['MD a.js',                    '1D',          'staged then deleted'],
-    ['R  a.js -> b.js',            '1R',          'renamed'],
-    ['?? note.txt',                '1?',          'untracked'],
-    ['UU conflict.js',             '1!',          'merge conflict'],
-    ['DD a.js',                    '1!',          'both deleted (unmerged)'],
-    ['AA a.js',                    '1!',          'both added (unmerged)'],
-    [' M a.js\n M b.js\n?? c.txt', '2M 1?',       'mixed'],
-    [' M a.js\n D b.js\n?? c.txt', '1M 1D 1?',    'M+D+?'],
-    [' M a.js\nUU b.js',           '1M',          'M present in dim'],
-  ];
-
-  for (const [porcelain, expected, desc] of cases) {
-    const git = (file, args) => {
-      const key = args.join(' ');
-      if (key === 'status --porcelain') return porcelain;
-      if (key === 'branch --show-current') return 'main';
-      return '';
-    };
-    const { text } = runStatusline(inputFor(dir), {}, git);
-    assert(text.includes(expected), `${desc}: expected "${expected}" in: ${text}`);
-  }
-
-  // Conflict marker is rendered separately and stays visible
-  const conflictGit = (file, args) => {
-    const key = args.join(' ');
-    if (key === 'status --porcelain') return ' M a.js\nUU b.js';
-    if (key === 'branch --show-current') return 'main';
-    return '';
-  };
-  const { text } = runStatusline(inputFor(dir), {}, conflictGit);
-  assert(text.includes('1!'), `conflict marker missing: ${text}`);
-});
-
-check('git segment shows detached HEAD short sha', () => {
-  const dir = makeTempDir();
-  const git = (file, args) => {
-    assert.strictEqual(file, 'git');
-    const key = args.join(' ');
-    const responses = {
-      'status --porcelain': '',
-      'branch --show-current': '',
-      'rev-parse --short HEAD': 'deadbee'
-    };
-    return responses[key] || '';
-  };
-
-  const { text } = runStatusline(inputFor(dir), {}, git);
-  assert(text.includes(`${path.basename(dir)} (HEAD@deadbee)`), text);
 });
 
 check('rate limits show 5h and 7d countdowns with coarse 7d', () => {
@@ -364,8 +200,8 @@ check('rate limits show 5h and 7d countdowns with coarse 7d', () => {
       seven_day: { used_percentage: 42, resets_at: now + 388800 }    // 4d12h → "4d"
     }
   })).text;
-  assert(t1.includes('5h:35%(2h15m)'), t1);
-  assert(t1.includes('7d:42%(4d)'), t1);
+  assert(t1.includes('5h:35% (2h15m)'), t1);
+  assert(t1.includes('7d:42% (4d)'), t1);
   assert(!t1.includes('4d12h'), `7d must drop hours when ≥2d, got: ${t1}`);
 
   // 7d with <2d remaining keeps hours.
@@ -374,7 +210,7 @@ check('rate limits show 5h and 7d countdowns with coarse 7d', () => {
       seven_day: { used_percentage: 88, resets_at: now + 169200 }    // 1d23h → "1d23h"
     }
   })).text;
-  assert(t2.includes('7d:88%(1d23h)'), t2);
+  assert(t2.includes('7d:88% (1d23h)'), t2);
 
   // Exactly 2d → still coarse.
   const t3 = runStatusline(inputFor(dir, {
@@ -382,7 +218,7 @@ check('rate limits show 5h and 7d countdowns with coarse 7d', () => {
       seven_day: { used_percentage: 50, resets_at: now + 172800 }    // 2d → "2d"
     }
   })).text;
-  assert(t3.includes('7d:50%(2d)'), t3);
+  assert(t3.includes('7d:50% (2d)'), t3);
 
   // Exactly 1d → "24h", never bare "1d".
   const t4 = runStatusline(inputFor(dir, {
@@ -390,14 +226,14 @@ check('rate limits show 5h and 7d countdowns with coarse 7d', () => {
       seven_day: { used_percentage: 90, resets_at: now + 86400 }     // 1d → "24h"
     }
   })).text;
-  assert(t4.includes('7d:90%(24h)'), t4);
+  assert(t4.includes('7d:90% (24h)'), t4);
   assert(!/\(1d\)/.test(t4), `must not render bare "1d", got: ${t4}`);
 
   // No reset_at → no countdown; 7d still shows pct.
   const minimal = runStatusline(inputFor(dir, {
     rate_limits: { seven_day: { used_percentage: 99 } }
   })).text;
-  assert(/7d:99%(?!\()/.test(minimal), minimal);
+  assert(/7d:99%(?! \()/.test(minimal), minimal);
 });
 
 check('cache TTL and JSONL parsing', () => {
@@ -524,154 +360,6 @@ check('transcript slug encoding replaces dots in directory paths', () => {
     }
   }), { CLAUDE_CONFIG_DIR: claude });
   assert(text.includes('cache 99% ↓1k +10 1h:'), text);
-});
-
-check('launch-dir breadcrumb appears only when project_dir differs from current_dir', () => {
-  const parent = makeTempDir();
-  const launch = path.join(parent, 'rootproj');
-  const current = path.join(parent, 'subproj');
-  fs.mkdirSync(launch);
-  fs.mkdirSync(current);
-  const base = (project_dir) => ({
-    model: { display_name: 'Claude' },
-    session_id: 'test-session',
-    workspace: { current_dir: current, project_dir }
-  });
-
-  // Differs → "rootproj ▸ subproj" breadcrumb.
-  const first = runStatusline(base(launch));
-  assert(first.text.includes('rootproj ▸ subproj'), `breadcrumb expected: ${first.text}`);
-  // Crumb and dir name share one dim span — no reset/re-open seam inside the segment.
-  assert(first.raw.includes('\x1b[2mrootproj ▸ subproj\x1b[0m'), `single dim span: ${JSON.stringify(first.raw)}`);
-
-  // Branch still binds to the current dir, not the launch root.
-  const git = (file, args) => args.join(' ') === 'branch --show-current' ? 'feat' : '';
-  const withBranch = runStatusline(base(launch), {}, git).text;
-  assert(withBranch.includes('rootproj ▸ subproj (feat)'), `branch on current dir: ${withBranch}`);
-
-  // Equal dirs → no breadcrumb, no triangle.
-  const same = runStatusline(base(current)).text;
-  assert(same.includes('subproj'), same);
-  assert(!same.includes('▸'), `no breadcrumb when equal: ${same}`);
-
-  // project_dir absent → no breadcrumb (back-compat with older Claude Code).
-  const absent = runStatusline(inputFor(current)).text;
-  assert(!absent.includes('▸'), `no breadcrumb when project_dir absent: ${absent}`);
-});
-
-check('launch-dir basename stays full on short lines (no eager ellipsis)', () => {
-  const parent = makeTempDir();
-  const launch = path.join(parent, '0123456789'.repeat(3)); // 30 chars
-  const current = path.join(parent, 'work');
-  fs.mkdirSync(launch);
-  fs.mkdirSync(current);
-
-  const { text } = runStatusline({
-    model: { display_name: 'Claude' },
-    session_id: 'test-session',
-    workspace: { current_dir: current, project_dir: launch }
-  });
-  assert(text.includes(`${'0123456789'.repeat(3)} ▸ work`), `full launch name on a short line: ${text}`);
-});
-
-check('breadcrumb participates in the 100-column budget: full → shortened → dropped', () => {
-  const parent = makeTempDir();
-  const launch = path.join(parent, '0123456789'.repeat(3)); // 30 chars
-  const current = path.join(parent, 'work'); // ≤15 chars: the old dirRaw!==dirShort gate never fired
-  fs.mkdirSync(launch);
-  fs.mkdirSync(current);
-  const at = (modelLen) => runStatusline({
-    model: { display_name: 'M'.repeat(modelLen) }, // unrecognised → rendered as-is
-    session_id: 'test-session',
-    workspace: { current_dir: current, project_dir: launch }
-  }).text;
-
-  // model(50) + crumb(30+3) + dir(4) + separators = 90 visible cols → fits, full crumb.
-  const fits = at(50);
-  assert(fits.includes('012345678901234567890123456789 ▸ work'), `fits, full crumb: ${fits}`);
-
-  // model(70) → 110 cols with the full crumb: launch name is shortened (→ 95).
-  const mid = at(70);
-  assert(mid.includes('0123456…3456789 ▸ work'), `shortened crumb: ${mid}`);
-
-  // model(90) → over budget even shortened (115): the crumb is dropped, dir stays.
-  const wide = at(90);
-  assert(!wide.includes('▸'), `crumb dropped: ${wide}`);
-  assert(wide.includes('work'), `dir name kept: ${wide}`);
-});
-
-check('no breadcrumb when project_dir is the same dir in a different spelling', () => {
-  const current = makeTempDir();
-  const { text } = runStatusline({
-    model: { display_name: 'Claude' },
-    session_id: 'test-session',
-    workspace: { current_dir: current, project_dir: current + path.sep }
-  });
-  assert(!text.includes('▸'), `trailing separator must not fake a move: ${text}`);
-
-  // Case-only difference: win32 filesystems are case-insensitive, so a case
-  // mismatch between the two stdin fields is the same dir, not a move.
-  // On POSIX differently-cased paths are genuinely distinct directories.
-  const cased = runStatusline({
-    model: { display_name: 'Claude' },
-    session_id: 'test-session',
-    workspace: { current_dir: current, project_dir: current.toUpperCase() }
-  }).text;
-  if (process.platform === 'win32') {
-    assert(!cased.includes('▸'), `case difference must not fake a move on win32: ${cased}`);
-  } else if (current !== current.toUpperCase()) {
-    assert(cased.includes('▸'), `distinct dirs must show the crumb on POSIX: ${cased}`);
-  }
-});
-
-check('width budget stage 1: dir name is ellipsised while the crumb stays full', () => {
-  const parent = makeTempDir();
-  const launch = path.join(parent, 'launchdir0');            // 10 chars — never needs shortening
-  const current = path.join(parent, '0123456789'.repeat(3)); // 30 chars — ellipsised first
-  fs.mkdirSync(launch);
-  fs.mkdirSync(current);
-
-  // model(60) + crumb(10+3) + dir(30) = 106 cols → stage 1 trims the dir name
-  // (→ 91) and stops: the launch name must survive in full.
-  const { text } = runStatusline({
-    model: { display_name: 'M'.repeat(60) },
-    session_id: 'test-session',
-    workspace: { current_dir: current, project_dir: launch }
-  });
-  assert(text.includes('launchdir0 ▸ 0123456…3456789'), `stage 1 keeps the crumb full: ${text}`);
-});
-
-check('width budget adapts to the COLUMNS env var, falling back to 100', () => {
-  const parent = makeTempDir();
-  const launch = path.join(parent, '0123456789'.repeat(3)); // 30 chars
-  const current = path.join(parent, 'work');
-  fs.mkdirSync(launch);
-  fs.mkdirSync(current);
-  const at = (modelLen, env) => runStatusline({
-    model: { display_name: 'M'.repeat(modelLen) }, // unrecognised → rendered as-is
-    session_id: 'test-session',
-    workspace: { current_dir: current, project_dir: launch }
-  }, env).text;
-
-  // Wide terminal: model(90) + full crumb = 130 cols — dropped at the default
-  // budget (see the staging test above), but COLUMNS=140 keeps it in full.
-  const wide = at(90, { COLUMNS: '140' });
-  assert(wide.includes('012345678901234567890123456789 ▸ work'), `COLUMNS=140 keeps the full crumb: ${wide}`);
-
-  // Narrow terminal: model(50) + full crumb = 90 cols — fits the default
-  // budget, but COLUMNS=60 walks all reclaim stages and drops the crumb.
-  const narrow = at(50, { COLUMNS: '60' });
-  assert(!narrow.includes('▸'), `COLUMNS=60 drops the crumb: ${narrow}`);
-  assert(narrow.includes('work'), `dir name kept: ${narrow}`);
-
-  // Invalid values fall back to the historical 100-column budget:
-  // 90 cols still fits, 130 cols still drops the crumb.
-  for (const bad of ['abc', '0', '-50', '']) {
-    const fits = at(50, { COLUMNS: bad });
-    assert(fits.includes('012345678901234567890123456789 ▸ work'), `COLUMNS=${JSON.stringify(bad)} → 100, 90 cols fit: ${fits}`);
-    const over = at(90, { COLUMNS: bad });
-    assert(!over.includes('▸'), `COLUMNS=${JSON.stringify(bad)} → 100, 130 cols drop the crumb: ${over}`);
-  }
 });
 
 check('cache TTL reads transcript_path from stdin, ignoring the current_dir slug', () => {
