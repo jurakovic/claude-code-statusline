@@ -162,7 +162,7 @@ process.stdin.on('end', () => {
           const ttlMs = lastWriteTtl === '5m' ? 300000 : 3600000;
           const remainingSec = (ttlMs - (Date.now() - lastTouchTs)) / 1000;
           const bucketColor = lastWriteTtl === '5m' ? '\x1b[33m' : '\x1b[2;36m';
-          let suffix = `${bucketColor}${lastWriteTtl}\x1b[0m`;
+          let suffix = `${bucketColor}${lastWriteTtl}:\x1b[0m`;
           let timeStr;
           if (remainingSec <= 0) timeStr = '0m';
           else if (remainingSec < 60) timeStr = Math.ceil(remainingSec) + 's';
@@ -178,7 +178,7 @@ process.stdin.on('end', () => {
           else if (pct < 0.1) countColor = '\x1b[38;2;255;140;0m';
           else if (pct < 0.25) countColor = '\x1b[33m';
           else countColor = '\x1b[2m';
-          suffix += `${countColor}:${timeStr}\x1b[0m`;
+          suffix += `${countColor}${timeStr}\x1b[0m`;
           parts.push(suffix);
         }
         cacheSegment = parts.join(' ');

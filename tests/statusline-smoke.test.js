@@ -276,6 +276,24 @@ check('cache TTL and JSONL parsing', () => {
   assert(out.includes('cache 99% ↓2k +20 1h:0m'), out);
 });
 
+check('cache TTL colon takes the bucket color, not the countdown color', () => {
+  const dir = makeTempDir();
+  const claude = makeTempDir();
+  const session = 'ttl-color-session';
+  writeTranscript(claude, dir, session, [
+    JSON.stringify({ type: 'assistant', timestamp: new Date(Date.now() - 6 * 60 * 1000).toISOString(), message: { usage: { cache_read_input_tokens: 1000, cache_creation_input_tokens: 10, cache_creation: { ephemeral_5m_input_tokens: 10 } } } })
+  ]);
+
+  const { raw } = runStatusline(inputFor(dir, {
+    session_id: session,
+    context_window: {
+      current_usage: { cache_read_input_tokens: 1000, cache_creation_input_tokens: 10, input_tokens: 0 }
+    }
+  }), { CLAUDE_CONFIG_DIR: claude });
+  // Expired 5m bucket: yellow "5m:" label, red "0m" countdown.
+  assert(raw.includes('\x1b[33m5m:\x1b[0m\x1b[31m0m\x1b[0m'), JSON.stringify(raw));
+});
+
 check('cache miss renders bold red zero-percent hit ratio', () => {
   const dir = makeTempDir();
   const { raw, text } = runStatusline(inputFor(dir, {
