@@ -27,6 +27,11 @@ at a glance. Segments only appear when they have something to say.
 | `5h:35% (2h15m)` | 5-hour rate limit usage + reset countdown (`XhYm` / `Mm`) |
 | `7d:42% (4d)` | 7-day rate limit usage + reset countdown. Coarse format: `Nd` while ≥ 2 days remain; `1dXh` for the final day (renders as `24h` at exactly 1 day so the unit doesn't lie); `XhYm` / `Mm` below 1 day |
 
+Rate limits come from the payload, which only refreshes when this session gets an
+API response. A window whose reset time has already passed renders as `0%` with no
+countdown instead of the stale pre-reset number; to see what other sessions have
+used in the meantime, turn on [`--shared-rate-limits`](#options).
+
 The context bar and rate-limit percentages share one color ramp:
 
 | Used | Color |
@@ -67,6 +72,15 @@ context window, rate limits) and writes a single ANSI-coloured
 line to stdout. It exits silently on any error so a broken statusline never blocks your
 session.
 
+## Options
+
+Flags go at the end of the `command` string in `settings.json`, for example
+`"command": "node \"/absolute/path/to/statusline.js\" --shared-rate-limits"`.
+
+| Flag | Effect |
+|------|--------|
+| `--shared-rate-limits` | Share 5h/7d rate-limit readings across sessions. Rate limits are account-wide, but a session's payload only refreshes when that session gets an API response, so an idle session keeps showing numbers another session has already moved. With the flag on, every render publishes its reading to `<config dir>/statusline-ratelimits.json` (`CLAUDE_CONFIG_DIR`, else `~/.claude`, so separate accounts never pool their readings) and displays the newest observation of each bucket, whoever made it. Readings are ranked by when they were observed — the last API response in the transcript — and one that can't be dated is shown but never published. This is a shared last-known-good, not a live feed. Off by default: without the flag no file is read or written |
+
 ## Optional companion hooks
 
 ### Why MD sync matters
@@ -104,7 +118,8 @@ None of them are required for the statusline itself to work.
 ## How it stays fast
 
 - **No subprocesses, no network.** Everything comes from stdin plus the session transcript.
-- **Bounded transcript read.** Only the last 16 KB of the transcript is read, and only when the cache segment needs its TTL bucket or a `/compact` reset check.
+- **Bounded transcript read.** Only the last 16 KB of the transcript is read, and only when the cache segment needs its TTL bucket or a `/compact` reset check, or `--shared-rate-limits` needs the time of the last response.
+- **Shared rate limits stay cheap.** With `--shared-rate-limits`, each render reads one small JSON file and writes it only when this session holds a newer, different reading, via a temp file + rename so a concurrent reader never sees a partial file.
 - **Stdin timeout (3s)** — if Claude Code never sends data, the script exits cleanly instead of hanging.
 
 ## Cross-platform notes

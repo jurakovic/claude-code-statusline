@@ -3,10 +3,31 @@
 // Shows: context usage | prompt cache | rate limits
 // Trimmed from https://github.com/ilia-pluzhnikov/claude-code-statusline
 // (model / directory / git segments removed)
+//
+// Flags (append to the "command" string in settings.json):
+//
+//   --shared-rate-limits   Share 5h/7d rate-limit observations across sessions.
+//
+// Rate limits are account-wide, but the payload Claude Code pipes in here only
+// refreshes when THIS session gets an API response. So a session sitting idle
+// while another burns quota keeps rendering numbers that have already moved.
+// With the flag on, every render publishes what it observed to
+//
+//   <config dir>/statusline-ratelimits.json
+//
+// and displays the newest observation of each bucket, whoever made it. The file
+// lives in the config dir (CLAUDE_CONFIG_DIR, else ~/.claude) so that separate
+// accounts under separate config dirs never pool their quota readings.
+//
+// Off by default: without the flag no file is read or written and the payload is
+// displayed as-is. Staleness is still bounded by "some live session made a
+// request" -- this is a shared last-known-good, not a live feed.
 
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
+
+const sharedRateLimits = process.argv.includes('--shared-rate-limits');
 
 let input = '';
 const stdinTimeout = setTimeout(() => process.exit(0), 3000);
@@ -73,6 +94,9 @@ process.stdin.on('end', () => {
 
     // --- Prompt cache state ---
     let cacheSegment = '';
+    // Timestamp of the last API response in this session; doubles as the
+    // observation time of this payload's rate_limits.
+    let lastAssistantTs = null;
     try {
       const usage = data.context_window?.current_usage;
       const usageNull = usage === null || usage === undefined;
@@ -84,7 +108,7 @@ process.stdin.on('end', () => {
       let lastWriteTtl = null;
       let hadCacheBefore = false;
 
-      if (session && (read > 0 || write > 0 || usageNull)) {
+      if (session && (read > 0 || write > 0 || usageNull || sharedRateLimits)) {
         try {
           let transcriptPath = data.transcript_path;
           if (!transcriptPath) {
@@ -116,6 +140,12 @@ process.stdin.on('end', () => {
                 const rec = JSON.parse(lines[i]);
                 const u = rec && rec.type === 'assistant' && rec.message ? rec.message.usage : null;
                 if (!u || !rec.timestamp) continue;
+
+                if (!lastAssistantTs) {
+                  const ats = new Date(rec.timestamp).getTime();
+                  if (Number.isFinite(ats)) lastAssistantTs = ats;
+                }
+
                 const r = u.cache_read_input_tokens || 0;
                 const w = u.cache_creation_input_tokens || 0;
                 if (r === 0 && w === 0) continue;
@@ -212,20 +242,99 @@ process.stdin.on('end', () => {
       };
       const withReset = (label, bucket, opts) => {
         const rawUsedPct = bucket.used_percentage;
-        const usedPct = (rawUsedPct == null || rawUsedPct === '') ? NaN : Number(rawUsedPct);
+        let usedPct = (rawUsedPct == null || rawUsedPct === '') ? NaN : Number(rawUsedPct);
         if (!Number.isFinite(usedPct)) return null;
+
+        // The payload only refreshes on an API response, so once the window has
+        // rolled over the cached percentage is known-stale rather than merely old.
+        const expired = Number.isFinite(bucket.resets_at) && bucket.resets_at * 1000 <= Date.now();
+        if (expired) usedPct = 0;
+
         const pct = Math.round(usedPct);
-        const reset = formatReset(bucket.resets_at, opts);
+        const reset = expired ? null : formatReset(bucket.resets_at, opts);
         const main = `${label}:${colorPct(pct)}`;
         return reset ? `${main} \x1b[2m(${reset})\x1b[0m` : main;
       };
+      const rlCachePath = path.join(claudeDir, 'statusline-ratelimits.json');
+      const shared = {};
+      let sharedDirty = false;
+
+      if (sharedRateLimits) {
+        try {
+          const parsed = JSON.parse(fs.readFileSync(rlCachePath, 'utf8'));
+          if (parsed && typeof parsed === 'object') Object.assign(shared, parsed);
+        } catch (e) {}
+      }
+
+      const numOr = (v, d) => {
+        const n = Number(v);
+        return Number.isFinite(n) ? n : d;
+      };
+
+      // Newer of two observations of one bucket. observed_at is wall-clock and the
+      // only trustworthy recency signal, so it is ranked first: an undated record
+      // (observed_at 0) always loses. Ranking resets_at first instead lets one bad
+      // far-future resets_at outrank every real reading, forever.
+      const newer = (a, b) => {
+        if (!a) return b;
+        if (!b) return a;
+        if (a.observed_at !== b.observed_at) return a.observed_at > b.observed_at ? a : b;
+        // Undated on both sides: a later window is newer, and within one window
+        // usage only ever climbs.
+        if (a.resets_at !== b.resets_at) return a.resets_at > b.resets_at ? a : b;
+        return a.used_percentage >= b.used_percentage ? a : b;
+      };
+
+      const resolve = (key, bucket) => {
+        if (!sharedRateLimits) return bucket;
+        const rawPct = bucket.used_percentage;
+        const pct = (rawPct == null || rawPct === '') ? NaN : Number(rawPct);
+        if (!Number.isFinite(pct)) return bucket;
+
+        const mine = {
+          used_percentage: pct,
+          resets_at: numOr(bucket.resets_at, 0),
+          observed_at: numOr(lastAssistantTs, 0),
+        };
+        const rec = shared[key];
+        const theirs = (rec && Number.isFinite(Number(rec.used_percentage))) ? {
+          used_percentage: Number(rec.used_percentage),
+          resets_at: numOr(rec.resets_at, 0),
+          observed_at: numOr(rec.observed_at, 0),
+        } : null;
+
+        const win = newer(mine, theirs);
+        // An undatable observation is fine to display but must never be published:
+        // peers cannot rank it, so it would outlive every real reading.
+        if (win === mine && mine.observed_at > 0 && (!theirs
+            || theirs.used_percentage !== mine.used_percentage
+            || theirs.resets_at !== mine.resets_at)) {
+          shared[key] = mine;
+          sharedDirty = true;
+        }
+        return win;
+      };
+
       if (rl.five_hour) {
-        const p = withReset('5h', rl.five_hour);
+        const p = withReset('5h', resolve('five_hour', rl.five_hour));
         if (p) limitParts.push(p);
       }
       if (rl.seven_day) {
-        const p = withReset('7d', rl.seven_day, { coarse: true });
+        const p = withReset('7d', resolve('seven_day', rl.seven_day), { coarse: true });
         if (p) limitParts.push(p);
+      }
+
+      // Replace via rename so a concurrent reader never sees a half-written file.
+      if (sharedDirty) {
+        try {
+          const tmp = rlCachePath + '.' + process.pid + '.tmp';
+          fs.writeFileSync(tmp, JSON.stringify(shared));
+          try {
+            fs.renameSync(tmp, rlCachePath);
+          } catch (e) {
+            try { fs.unlinkSync(tmp); } catch (e2) {}
+          }
+        } catch (e) {}
       }
     }
 

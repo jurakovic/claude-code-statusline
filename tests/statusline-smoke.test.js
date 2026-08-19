@@ -13,7 +13,7 @@ function stripAnsi(s) {
   return s.replace(/\x1b\[[0-9;]*m/g, '');
 }
 
-function runStatusline(input, env = {}) {
+function runStatusline(input, env = {}, args = []) {
   let stdout = '';
   const stdin = new EventEmitter();
   stdin.setEncoding = () => {};
@@ -21,6 +21,7 @@ function runStatusline(input, env = {}) {
     require,
     process: {
       env: { ...process.env, ...env },
+      argv: ['node', statusline, ...args],
       stdin,
       stdout: { write: (s) => { stdout += s; } },
       cwd: () => root,
@@ -70,6 +71,11 @@ function writeTranscript(claudeDir, dir, session, records) {
   const projectDir = path.join(claudeDir, 'projects', slugFor(dir));
   fs.mkdirSync(projectDir, { recursive: true });
   fs.writeFileSync(path.join(projectDir, `${session}.jsonl`), records.join('\n') + '\n');
+}
+
+// An API response with no cache activity: dates the payload, nothing else.
+function assistantAt(msAgo) {
+  return JSON.stringify({ type: 'assistant', timestamp: new Date(Date.now() - msAgo).toISOString(), message: { usage: { input_tokens: 10 } } });
 }
 
 const failures = [];
@@ -234,6 +240,72 @@ check('rate limits show 5h and 7d countdowns with coarse 7d', () => {
     rate_limits: { seven_day: { used_percentage: 99 } }
   })).text;
   assert(/7d:99%(?! \()/.test(minimal), minimal);
+});
+
+check('expired rate-limit window renders 0% with no countdown', () => {
+  const dir = makeTempDir();
+  const now = Math.floor(Date.now() / 1000);
+  const { text } = runStatusline(inputFor(dir, {
+    rate_limits: {
+      five_hour: { used_percentage: 87, resets_at: now - 60 },  // rolled over a minute ago
+      seven_day: { used_percentage: 40, resets_at: now + 7200 }
+    }
+  }));
+  assert(/5h:0%(?! \()/.test(text), `expired 5h: ${text}`);
+  assert(text.includes('7d:40% (2h)'), `live 7d untouched: ${text}`);
+});
+
+check('--shared-rate-limits publishes the reading and shows the newest one', () => {
+  const dir = makeTempDir();
+  const claude = makeTempDir();
+  const cache = path.join(claude, 'statusline-ratelimits.json');
+  const resets_at = Math.floor(Date.now() / 1000) + 3600;
+  writeTranscript(claude, dir, 'fresh', [assistantAt(60 * 1000)]);
+  writeTranscript(claude, dir, 'idle', [assistantAt(30 * 60 * 1000)]);
+  const run = (session, used_percentage) => runStatusline(inputFor(dir, {
+    session_id: session,
+    rate_limits: { five_hour: { used_percentage, resets_at } }
+  }), { CLAUDE_CONFIG_DIR: claude }, ['--shared-rate-limits']).text;
+
+  // The session that heard from the API most recently publishes its reading.
+  const fresh = run('fresh', 40);
+  assert(fresh.includes('5h:40%'), fresh);
+  const published = JSON.parse(fs.readFileSync(cache, 'utf8'));
+  assert.strictEqual(published.five_hour.used_percentage, 40);
+  assert.strictEqual(published.five_hour.resets_at, resets_at);
+
+  // An idle session holding an older reading shows the newer shared one
+  // and leaves the file alone.
+  const idle = run('idle', 10);
+  assert(idle.includes('5h:40%'), `idle session shows the shared reading: ${idle}`);
+  assert.strictEqual(JSON.parse(fs.readFileSync(cache, 'utf8')).five_hour.used_percentage, 40);
+});
+
+check('--shared-rate-limits is off by default and never publishes undated readings', () => {
+  const dir = makeTempDir();
+  const claude = makeTempDir();
+  const cache = path.join(claude, 'statusline-ratelimits.json');
+  const resets_at = Math.floor(Date.now() / 1000) + 3600;
+  writeTranscript(claude, dir, 'dated', [assistantAt(60 * 1000)]);
+  const input = (session) => inputFor(dir, {
+    session_id: session,
+    rate_limits: { five_hour: { used_percentage: 25, resets_at } }
+  });
+
+  // Without the flag nothing is written...
+  const plain = runStatusline(input('dated'), { CLAUDE_CONFIG_DIR: claude }).text;
+  assert(plain.includes('5h:25%'), plain);
+  assert(!fs.existsSync(cache), 'no file without the flag');
+
+  // ...a reading with no transcript to date it is shown but not published...
+  const undated = runStatusline(input('undated'), { CLAUDE_CONFIG_DIR: claude }, ['--shared-rate-limits']).text;
+  assert(undated.includes('5h:25%'), undated);
+  assert(!fs.existsSync(cache), 'undated reading must not be published');
+
+  // ...and without the flag a newer shared reading is ignored.
+  fs.writeFileSync(cache, JSON.stringify({ five_hour: { used_percentage: 90, resets_at, observed_at: Date.now() } }));
+  const ignored = runStatusline(input('dated'), { CLAUDE_CONFIG_DIR: claude }).text;
+  assert(ignored.includes('5h:25%'), `shared file ignored without the flag: ${ignored}`);
 });
 
 check('cache TTL and JSONL parsing', () => {
