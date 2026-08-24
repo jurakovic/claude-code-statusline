@@ -53,8 +53,8 @@ process.stdin.on('end', () => {
     };
 
     // Shared "how full is it" ramp, highest band first. Used by the context bar and
-    // the rate limits — both count up toward bad. Not by the cache ratio, which is
-    // inverted (high is good).
+    // the rate limits — both count up toward bad. The cache ratio runs it
+    // backwards, minus the cyan band, because there high is good.
     const bands = [
       [80, '\x1b[31m'],              // red
       [70, '\x1b[38;2;255;87;34m'],  // vermilion
@@ -65,7 +65,11 @@ process.stdin.on('end', () => {
       [15, '\x1b[32m'],              // green
       [0, '\x1b[38;2;34;184;207m'],  // cyan
     ];
-    const bandColor = (pct) => (bands.find(([min]) => pct >= min) || bands[bands.length - 1])[1];
+    const bandColor = (pct, list = bands) => (list.find(([min]) => pct >= min) || list[list.length - 1])[1];
+
+    // The cache ratio tops out at green: cyan would read as "better than fine". The
+    // two extremes get bold accents at the call site instead.
+    const cacheBands = bands.slice(0, -1);
 
     // --- Context window ---
     let ctx = '';
@@ -172,12 +176,12 @@ process.stdin.on('end', () => {
         const denom = read + write + freshInput;
         if (denom > 0) {
           const ratio = read > 0 ? Math.round(read / denom * 100) : 0;
+          // Shared ramp read backwards, bold at both extremes: a hit rate this high
+          // is better than the ramp's top band, and a cold cache is worse than its floor.
           let ratioColor;
           if (ratio === 0) ratioColor = '\x1b[1;31m';
           else if (ratio >= 90) ratioColor = '\x1b[1;32m';
-          else if (ratio >= 75) ratioColor = '\x1b[32m';
-          else if (ratio >= 50) ratioColor = '\x1b[33m';
-          else ratioColor = '\x1b[38;2;255;140;0m';
+          else ratioColor = bandColor(100 - ratio, cacheBands);
           parts.push(`${ratioColor}${ratio}%\x1b[0m`);
         }
 

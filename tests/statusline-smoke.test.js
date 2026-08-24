@@ -381,6 +381,31 @@ check('cache miss renders bold red zero-percent hit ratio', () => {
   assert(text.includes('cache 0% ↑75k'), text);
 });
 
+check('cache hit ratio reads the shared ramp backwards, bold at both extremes', () => {
+  const dir = makeTempDir();
+  const cases = [
+    [95, '\x1b[1;32m'],             // bold green: better than the ramp's top band
+    [90, '\x1b[1;32m'],
+    [89, '\x1b[32m'],               // green — the ramp minus its cyan band tops out here
+    [85, '\x1b[32m'],
+    [70, '\x1b[38;2;116;184;22m'],  // lime
+    [60, '\x1b[33m'],               // yellow
+    [50, '\x1b[38;2;240;140;0m'],   // amber
+    [40, '\x1b[38;2;255;140;0m'],   // orange
+    [30, '\x1b[38;2;255;87;34m'],   // vermilion
+    [20, '\x1b[31m'],               // red
+    [5, '\x1b[31m'],
+  ];
+  for (const [ratio, color] of cases) {
+    const { raw } = runStatusline(inputFor(dir, {
+      context_window: {
+        current_usage: { cache_read_input_tokens: ratio, cache_creation_input_tokens: 0, input_tokens: 100 - ratio }
+      }
+    }));
+    assert(raw.includes(`\x1b[2mcache\x1b[0m ${color}${ratio}%\x1b[0m`), `${ratio}%: ${JSON.stringify(raw)}`);
+  }
+});
+
 check('cache reset renders after compact when current_usage is null', () => {
   const dir = makeTempDir();
   const claude = makeTempDir();
