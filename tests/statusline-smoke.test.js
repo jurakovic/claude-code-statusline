@@ -146,13 +146,42 @@ check('context bar shows the used percentage after the absolute token counts', (
   }));
   const segment = contextSegment(text);
   assert(segment, text);
-  assert(segment.endsWith('480k/1M 48%'), segment);
+  assert(segment.startsWith('██░░░ 480k/1M 48%'), segment);
 
   // Without absolute counters only the percentage follows the bar.
   const pctOnly = runStatusline(inputFor(dir, {
     context_window: { remaining_percentage: 60 }
   })).text;
   assert.strictEqual(contextSegment(pctOnly), '██░░░ 40%', pctOnly);
+});
+
+check('absolute-token dot marks raw counts from 200k up', () => {
+  const dir = makeTempDir();
+  const at = (total_input_tokens) => runStatusline(inputFor(dir, {
+    context_window: { remaining_percentage: 50, total_input_tokens, context_window_size: 1000000 }
+  }));
+
+  assert(!at(199999).text.includes('●'), `no dot below 200k: ${at(199999).text}`);
+  const marks = [
+    [200000, '\x1b[33m'],              // yellow
+    [350000, '\x1b[38;2;240;140;0m'],  // amber
+    [500000, '\x1b[38;2;255;140;0m'],  // orange
+    [650000, '\x1b[38;2;255;87;34m'],  // vermilion
+    [800000, '\x1b[31m'],              // red
+  ];
+  for (const [tokens, color] of marks) {
+    const { raw } = at(tokens);
+    assert(raw.endsWith(`\x1b[0m ${color}●\x1b[0m`), `${tokens}: ${JSON.stringify(raw)}`);
+  }
+
+  // Keyed on the raw count, not the bar: 250k of 1M is a calm green bar plus a dot.
+  const wide = at(250000).raw;
+  assert(wide.startsWith('\x1b[32m'), `bar keeps its own color: ${JSON.stringify(wide)}`);
+  assert(wide.includes('\x1b[33m●'), `dot at 250k: ${JSON.stringify(wide)}`);
+
+  // No absolute counters → no dot.
+  const pctOnly = runStatusline(inputFor(dir, { context_window: { remaining_percentage: 10 } })).text;
+  assert(!pctOnly.includes('●'), pctOnly);
 });
 
 check('context bar and rate limits share one color ramp', () => {
@@ -195,20 +224,19 @@ check('context bar prefers absolute tokens over remaining_percentage', () => {
   assert(contextBar(segment) === '████░', `expected 4 full cells, got: ${contextBar(segment)}`);
 });
 
-check('rate limits show 5h and 7d countdowns with coarse 7d', () => {
+check('rate limits show 5h and 7d countdowns in one format', () => {
   const dir = makeTempDir();
   const now = Math.floor(Date.now() / 1000);
 
-  // 5h shows precise h+m; 7d ≥2d is coarse (days only).
+  // 5h shows precise h+m; 7d keeps its hours at any distance.
   const t1 = runStatusline(inputFor(dir, {
     rate_limits: {
       five_hour: { used_percentage: 35, resets_at: now + 8100 },     // 2h15m
-      seven_day: { used_percentage: 42, resets_at: now + 388800 }    // 4d12h → "4d"
+      seven_day: { used_percentage: 42, resets_at: now + 388800 }    // 4d12h
     }
   })).text;
   assert(t1.includes('5h:35% (2h15m)'), t1);
-  assert(t1.includes('7d:42% (4d)'), t1);
-  assert(!t1.includes('4d12h'), `7d must drop hours when ≥2d, got: ${t1}`);
+  assert(t1.includes('7d:42% (4d12h)'), t1);
 
   // 7d with <2d remaining keeps hours.
   const t2 = runStatusline(inputFor(dir, {
@@ -218,7 +246,7 @@ check('rate limits show 5h and 7d countdowns with coarse 7d', () => {
   })).text;
   assert(t2.includes('7d:88% (1d23h)'), t2);
 
-  // Exactly 2d → still coarse.
+  // Whole days drop the zero hour.
   const t3 = runStatusline(inputFor(dir, {
     rate_limits: {
       seven_day: { used_percentage: 50, resets_at: now + 172800 }    // 2d → "2d"
@@ -306,6 +334,59 @@ check('--shared-rate-limits is off by default and never publishes undated readin
   fs.writeFileSync(cache, JSON.stringify({ five_hour: { used_percentage: 90, resets_at, observed_at: Date.now() } }));
   const ignored = runStatusline(input('dated'), { CLAUDE_CONFIG_DIR: claude }).text;
   assert(ignored.includes('5h:25%'), `shared file ignored without the flag: ${ignored}`);
+});
+
+check('cost segment appears only while tokens are paid per use', () => {
+  const dir = makeTempDir();
+  const now = Math.floor(Date.now() / 1000);
+  const responded = { remaining_percentage: 90, total_input_tokens: 1000, context_window_size: 200000 };
+  const cost = { total_cost_usd: 3.456 };
+  const run = (overrides, args) => runStatusline(inputFor(dir, overrides), {}, args).text;
+  const fiveHour = (used_percentage, resets_at) => ({ five_hour: { used_percentage, resets_at } });
+
+  // API-key auth: no rate_limits once a response has landed.
+  const api = run({ context_window: responded, cost });
+  assert(api.endsWith(' │ $3.46'), api);
+
+  // Before the first response, missing rate_limits means "not arrived yet".
+  const early = run({ cost });
+  assert(!early.includes('$'), early);
+
+  // Subscription under its limits: hidden, unless --cost forces it.
+  const sub = { context_window: responded, cost, rate_limits: fiveHour(99, now + 3600) };
+  assert(!run(sub).includes('$'), run(sub));
+  assert(run(sub, ['--cost']).includes('$3.46 │ 5h:99% (1h)'), run(sub, ['--cost']));
+
+  // A spent bucket bills further usage as extra usage.
+  const spent = run({ context_window: responded, cost, rate_limits: fiveHour(100, now + 3600) });
+  assert(spent.includes('$3.46 │ 5h:100% (1h)'), spent);
+
+  // A stale 100% from a window that already rolled over does not count.
+  const rolled = run({ context_window: responded, cost, rate_limits: fiveHour(100, now - 60) });
+  assert(!rolled.includes('$'), rolled);
+
+  // Zero is the pre-first-response state, not a reading.
+  const zero = run({ context_window: responded, cost: { total_cost_usd: 0 } }, ['--cost']);
+  assert(!zero.includes('$'), zero);
+});
+
+check('cost segment is colored by amount and flags fast mode', () => {
+  const dir = makeTempDir();
+  const at = (usd, extra = {}) => runStatusline(inputFor(dir, { cost: { total_cost_usd: usd }, ...extra }), {}, ['--cost']).raw;
+  const cases = [
+    [0.5, '\x1b[38;2;34;184;207m$0.50'],  // cyan
+    [1, '\x1b[32m$1.00'],                 // green
+    [5, '\x1b[33m$5.00'],                 // yellow
+    [10, '\x1b[38;2;255;140;0m$10.00'],   // orange
+    [20, '\x1b[31m$20.00'],               // red
+    [123.4, '\x1b[31m$123'],              // whole dollars from $100
+  ];
+  for (const [usd, expected] of cases) {
+    const raw = at(usd);
+    assert(raw.includes(`${expected}\x1b[0m`), `${usd}: ${JSON.stringify(raw)}`);
+  }
+  const fast = at(2, { fast_mode: true });
+  assert(fast.includes('$2.00\x1b[0m \x1b[33m⚡\x1b[0m'), JSON.stringify(fast));
 });
 
 check('cache TTL and JSONL parsing', () => {

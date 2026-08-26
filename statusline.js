@@ -7,6 +7,7 @@
 // Flags (append to the "command" string in settings.json):
 //
 //   --shared-rate-limits   Share 5h/7d rate-limit observations across sessions.
+//   --cost                 Always show the session's estimated cost in USD.
 //
 // Rate limits are account-wide, but the payload Claude Code pipes in here only
 // refreshes when THIS session gets an API response. So a session sitting idle
@@ -22,12 +23,27 @@
 // Off by default: without the flag no file is read or written and the payload is
 // displayed as-is. Staleness is still bounded by "some live session made a
 // request" -- this is a shared last-known-good, not a live feed.
+//
+// The cost segment renders cost.total_cost_usd, which Claude Code computes
+// client-side for every session and warns may differ from the real bill. It
+// is detected rather than configured, and appears only while tokens are
+// actually being paid for, by either route:
+//
+//   * rate_limits absent once a response has landed -- the object is emitted
+//     only for Claude.ai subscribers, so nothing there means API-key auth.
+//   * a rate-limit bucket at 100% -- the window is spent, and further usage
+//     bills as extra usage on accounts that have it enabled.
+//
+// The second case cannot be told apart from "limit reached, simply blocked":
+// hasExtraUsageEnabled lives in .claude.json, not the payload. The adjacent
+// 5h:100% makes which one it is legible. --cost overrides and always shows.
 
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
 
 const sharedRateLimits = process.argv.includes('--shared-rate-limits');
+const forceCost = process.argv.includes('--cost');
 
 let input = '';
 const stdinTimeout = setTimeout(() => process.exit(0), 3000);
@@ -93,7 +109,22 @@ process.stdin.on('end', () => {
       const color = bandColor(used);
       const prefix = used >= 80 ? '💀 ' : '';
 
-      ctx = `${color}${prefix}${bar}${abs}\x1b[0m`;
+      // Absolute-token marker. The bar is proportional, so a wide window hides
+      // how many tokens actually go over the wire on every request: 250k reads as
+      // a calm 25% of 1M. This dot is keyed on the raw count instead and only
+      // appears once that count is worth noticing. It carries its own color and
+      // reset, so the bar's own reading is left untouched.
+      //
+      // Thresholds pair positionally with the ramp's five worst colors, in the
+      // same order: 200k is where Claude Code's own exceeds_200k_tokens line
+      // sits, then even 150k steps up to 800k. The calm end of the ramp goes
+      // deliberately unused -- a dot that appears when nothing is wrong is a
+      // fixture you stop reading.
+      const absMarks = [800000, 650000, 500000, 350000, 200000];
+      const markIdx = haveAbs ? absMarks.findIndex((min) => totalInput >= min) : -1;
+      const dot = markIdx >= 0 ? ` ${bands[markIdx][1]}●\x1b[0m` : '';
+
+      ctx = `${color}${prefix}${bar}${abs}\x1b[0m${dot}`;
     }
 
     // --- Prompt cache state ---
@@ -223,19 +254,19 @@ process.stdin.on('end', () => {
 
     // --- Rate limits (subscription) ---
     const limitParts = [];
+    // Highest bucket after expiry handling, for the cost segment's per-token check.
+    let maxRlPct = -1;
     const rl = data.rate_limits;
     if (rl) {
       const colorPct = (pct) => `${bandColor(pct)}${pct}%\x1b[0m`;
-      const formatReset = (resetTs, opts) => {
+      const formatReset = (resetTs) => {
         if (!Number.isFinite(resetTs)) return null;
-        const coarse = !!(opts && opts.coarse);
         const resetMin = Math.max(0, Math.ceil((resetTs * 1000 - Date.now()) / 60000));
         if (resetMin >= 1440) {
           const d = Math.floor(resetMin / 1440);
           const h = Math.floor((resetMin % 1440) / 60);
-          if (coarse && d >= 2) return `${d}d`;
           if (d === 1 && h === 0) return '24h';
-          return `${d}d${h}h`;
+          return h > 0 ? `${d}d${h}h` : `${d}d`;
         }
         if (resetMin >= 60) {
           const h = Math.floor(resetMin / 60);
@@ -244,7 +275,7 @@ process.stdin.on('end', () => {
         }
         return `${resetMin}m`;
       };
-      const withReset = (label, bucket, opts) => {
+      const withReset = (label, bucket) => {
         const rawUsedPct = bucket.used_percentage;
         let usedPct = (rawUsedPct == null || rawUsedPct === '') ? NaN : Number(rawUsedPct);
         if (!Number.isFinite(usedPct)) return null;
@@ -255,7 +286,8 @@ process.stdin.on('end', () => {
         if (expired) usedPct = 0;
 
         const pct = Math.round(usedPct);
-        const reset = expired ? null : formatReset(bucket.resets_at, opts);
+        if (pct > maxRlPct) maxRlPct = pct;
+        const reset = expired ? null : formatReset(bucket.resets_at);
         const main = `${label}:${colorPct(pct)}`;
         return reset ? `${main} \x1b[2m(${reset})\x1b[0m` : main;
       };
@@ -324,7 +356,7 @@ process.stdin.on('end', () => {
         if (p) limitParts.push(p);
       }
       if (rl.seven_day) {
-        const p = withReset('7d', resolve('seven_day', rl.seven_day), { coarse: true });
+        const p = withReset('7d', resolve('seven_day', rl.seven_day));
         if (p) limitParts.push(p);
       }
 
@@ -342,10 +374,42 @@ process.stdin.on('end', () => {
       }
     }
 
+    // --- Session cost ---
+    let costSegment = '';
+    // A populated context window means an API response has landed. Until then,
+    // missing rate_limits means "not arrived yet", not "this account has none".
+    const hadResponse = lastAssistantTs !== null
+      || Number(data.context_window?.total_input_tokens) > 0;
+    // Two routes to paying per token: no subscription buckets at all (API-key
+    // auth), or a bucket driven to 100% with usage continuing past it as extra
+    // usage. maxRlPct is the post-expiry figure, so a stale 100% left over from
+    // a window that already rolled over cannot pin the segment on.
+    const perToken = maxRlPct >= 100 || (hadResponse && !data.rate_limits);
+    if (forceCost || perToken) {
+      const usd = Number(data.cost?.total_cost_usd);
+      // Zero is the pre-first-response state, not a reading worth a segment.
+      if (Number.isFinite(usd) && usd > 0) {
+        const costMarks = [
+          [20, '\x1b[31m'],              // red
+          [10, '\x1b[38;2;255;140;0m'],  // orange
+          [5, '\x1b[33m'],               // yellow
+          [1, '\x1b[32m'],               // green
+          [0, '\x1b[38;2;34;184;207m'],  // cyan
+        ];
+        const costColor = (costMarks.find(([min]) => usd >= min) || costMarks[costMarks.length - 1])[1];
+        const amount = usd >= 100 ? String(Math.round(usd)) : usd.toFixed(2);
+        // Fast mode bills at a premium rate, so the same total represents less
+        // work. Flag it against the number rather than as its own segment.
+        const fast = data.fast_mode ? ' \x1b[33m⚡\x1b[0m' : '';
+        costSegment = `${costColor}$${amount}\x1b[0m${fast}`;
+      }
+    }
+
     // --- Output ---
     const segments = [];
     if (ctx) segments.push(ctx);
     if (cacheSegment) segments.push(cacheSegment);
+    if (costSegment) segments.push(costSegment);
     for (const lp of limitParts) segments.push(lp);
 
     process.stdout.write(segments.join(' │ '));

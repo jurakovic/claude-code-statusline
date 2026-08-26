@@ -11,7 +11,7 @@ No dependencies. No build step. Works on macOS, Linux, and Windows.
 ## Preview
 
 ```
-██░░░ 480k/1M 48% │ cache 87% ↓75k +360 1h:42m │ 5h:35% (2h15m) │ 7d:42% (4d)
+██░░░ 480k/1M 48% ● │ cache 87% ↓75k +360 1h:42m │ 5h:35% (2h15m) │ 7d:42% (4d12h)
 ```
 
 Each segment is color-coded so the shape of the line itself communicates urgency
@@ -23,9 +23,11 @@ at a glance. Segments only appear when they have something to say.
 | Segment | Meaning |
 |---------|---------|
 | `██░░░ 480k/1M 48%` | Context window usage — 5-cell bar with half-block precision (`█▌░`, ~10% per step in 5 cells), followed by the used percentage. When Claude Code provides absolute context counters, the bar is driven by `total_input_tokens / context_window_size` and the raw counts come before the percentage (`480k/1M 48%`). When only `remaining_percentage` is available, the bar falls back to `100 - remaining` and shows just the percentage |
+| `●` | Absolute-token marker after the context bar. The bar is proportional, so a wide window hides how many tokens go over the wire on every request — 250k reads as a calm 25% of 1M. The dot is keyed on the raw `total_input_tokens` instead: yellow from 200k (where Claude Code's own `exceeds_200k_tokens` line sits), then amber, orange, vermilion and red at 350k / 500k / 650k / 800k. Hidden below 200k |
 | `cache 87% ↓75k +360 1h:42m` | Prompt cache state. Read/write/input counters come from stdin `context_window.current_usage`; the session transcript only supplies the TTL bucket (`1h`/`5m`) and last-touch timestamp for the countdown. Hit ratio is `read / (input + write + read)`, colored from the shared ramp read backwards (a 70% hit ratio gets the color of 30% used) minus its cyan band: bold green at `≥90%`, green at 71–89%, lime at 61–70%, then yellow, amber, orange and vermilion every 10 points, red at `≤20%`, and bold red at `0%` for a full miss/invalidation. `↓` means tokens read from cache, `+` or `↑` means tokens written. The TTL label (`1h:` dim cyan, `5m:` yellow) is followed by the time left before the cache expires: dim while plenty remains, yellow under 25%, orange under 10%, red once expired. After `/compact`, `cache:reset` appears while stdin `current_usage` is null but the transcript shows earlier cache activity |
+| `$3.46` | Session cost estimate — `cost.total_cost_usd`, which Claude Code computes client-side and warns may differ from the real bill. Shown only while tokens are paid for per use: when there are no `rate_limits` once a response has landed (API-key auth), or when a rate-limit bucket is at 100% (further usage bills as extra usage on accounts that have it enabled; the adjacent `5h:100%` tells you which case it is). `--cost` always shows it. Cyan under $1, then green, yellow from $5, orange from $10, red from $20; whole dollars from $100. A yellow `⚡` follows it in fast mode, which bills at a premium rate |
 | `5h:35% (2h15m)` | 5-hour rate limit usage + reset countdown (`XhYm` / `Mm`) |
-| `7d:42% (4d)` | 7-day rate limit usage + reset countdown. Coarse format: `Nd` while ≥ 2 days remain; `1dXh` for the final day (renders as `24h` at exactly 1 day so the unit doesn't lie); `XhYm` / `Mm` below 1 day |
+| `7d:42% (4d12h)` | 7-day rate limit usage + reset countdown: `NdXh` (`Nd` on a whole day; exactly 1 day renders as `24h` so the unit doesn't lie), `XhYm` / `Mm` below 1 day |
 
 Rate limits come from the payload, which only refreshes when this session gets an
 API response. A window whose reset time has already passed renders as `0%` with no
@@ -68,7 +70,7 @@ The context bar and rate-limit percentages share one color ramp:
 4. **Restart Claude Code.** That's it.
 
 The script reads the standard Claude Code statusline JSON from stdin (session,
-context window, rate limits) and writes a single ANSI-coloured
+context window, rate limits, cost) and writes a single ANSI-coloured
 line to stdout. It exits silently on any error so a broken statusline never blocks your
 session.
 
@@ -80,6 +82,7 @@ Flags go at the end of the `command` string in `settings.json`, for example
 | Flag | Effect |
 |------|--------|
 | `--shared-rate-limits` | Share 5h/7d rate-limit readings across sessions. Rate limits are account-wide, but a session's payload only refreshes when that session gets an API response, so an idle session keeps showing numbers another session has already moved. With the flag on, every render publishes its reading to `<config dir>/statusline-ratelimits.json` (`CLAUDE_CONFIG_DIR`, else `~/.claude`, so separate accounts never pool their readings) and displays the newest observation of each bucket, whoever made it. Readings are ranked by when they were observed — the last API response in the transcript — and one that can't be dated is shown but never published. This is a shared last-known-good, not a live feed. Off by default: without the flag no file is read or written |
+| `--cost` | Always show the session cost segment, not just while tokens are paid for per use |
 
 ## Optional companion hooks
 
